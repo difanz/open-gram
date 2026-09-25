@@ -9,20 +9,21 @@ WORK ?= build/fixture
 MAX_KEYS ?= 4
 DICT_FULL ?= testdata/dict.full
 DICT_HEAD ?= $(ROOT)/lexicon/dict_head.utf8
-XML ?= testdata/wiki.xml
+FIXTURE_CORPUS ?= testdata/sentences.txt
 RELEASE_MAX_KEYS ?= 2000000
 
 all:
-	$(RUN) all --xml $(XML) --dict-full $(DICT_FULL) --dict-head $(DICT_HEAD) \
+	$(RUN) all --corpus $(FIXTURE_CORPUS) --dict-full $(DICT_FULL) --dict-head $(DICT_HEAD) \
 		--work $(WORK) --max-keys $(MAX_KEYS) --surface \
 		--cut 0,0,0 --discount ABS,0.5 --discount ABS,0.5 --discount ABS,0.5
 
 test:
 	$(PYTHON) $(ROOT)/pipeline/test_pipeline.py
+	$(PYTHON) $(ROOT)/importers/test_wikimedia.py
 
 release:
-	@test -n "$(DUMP)" || { echo "DUMP= pages-articles dump (optionally more paths)"; exit 1; }
-	$(RUN) all $(foreach d,$(DUMP),--xml $(d)) \
+	@test -n "$(CORPUS)" || { echo "CORPUS= sentence file is required"; exit 1; }
+	$(RUN) all --corpus $(CORPUS) \
 		--dict-full $(ROOT)/data/dict.full --dict-head $(DICT_HEAD) \
 		--work build/release --max-keys $(RELEASE_MAX_KEYS) --surface
 

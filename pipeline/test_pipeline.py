@@ -16,7 +16,6 @@ sys.path.insert(0, ROOT)
 from pipeline import arpa
 from pipeline import ngram_count
 from pipeline import segment
-from pipeline import wiki_text
 from pipeline.lexicon_build import build_dict_utf8, default_dict_head
 from pipeline.lexicon_io import Lexicon, load_dict_utf8
 from pipeline.run import main
@@ -28,7 +27,7 @@ def _read(path, errors=None):
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FIXTURE_XML = os.path.join(HERE, "testdata", "wiki.xml")
+FIXTURE_CORPUS = os.path.join(HERE, "testdata", "sentences.txt")
 FIXTURE_DICT = os.path.join(HERE, "testdata", "dict.full")
 DICT_HEAD = default_dict_head()
 DATA_DICT = os.path.join(ROOT, "data", "dict.full")
@@ -45,21 +44,6 @@ FIXTURE_ESTIMATE = [
 
 def _abs_discounts():
     return tuple(arpa.ABSDiscounter(0.5) for _ in range(3))
-
-
-class WikiTextTests(unittest.TestCase):
-    def test_fixture_keeps_article_sentences_only(self):
-        sentences = list(wiki_text.iter_article_sentences(FIXTURE_XML))
-        self.assertEqual(sentences, [
-            "北京是中国的首都。",
-            "我爱北京。",
-            "电话是12。",
-            "你好@北京。",
-            "京城欢迎你。",
-        ])
-        blob = "\n".join(sentences)
-        for marker in ("[[", "]]", "{{", "}}", "Category", "注", "不应", "REDIRECT", "参见"):
-            self.assertNotIn(marker, blob)
 
 
 class LexiconTests(unittest.TestCase):
@@ -290,7 +274,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             code = main([
                 "all",
-                "--xml", FIXTURE_XML,
+                "--corpus", FIXTURE_CORPUS,
                 "--dict-full", FIXTURE_DICT,
                 "--dict-head", DICT_HEAD,
                 "--work", tmp,
@@ -303,7 +287,7 @@ class PipelineTests(unittest.TestCase):
             sentences = _read(os.path.join(tmp, "sentences.txt"))
             segmented = _read(os.path.join(tmp, "segmented.txt"))
             self.assertIn("北京/是/中国/的/首都/。", segmented)
-            self.assertNotIn("[[", sentences)
+            self.assertEqual(sentences, _read(FIXTURE_CORPUS))
             lexicon = load_dict_utf8(dict_path)
             self.assertEqual(lexicon.word_to_id["北京"], 100)
             parsed = arpa.parse_arpa(_read(arpa_path))
@@ -322,7 +306,7 @@ class PipelineTests(unittest.TestCase):
                         self.assertIsNone(bow)
             self.assertIn("<Digit>", segmented)
             self.assertEqual(main([
-                "all", "--xml", FIXTURE_XML, "--dict-full", FIXTURE_DICT,
+                "all", "--corpus", FIXTURE_CORPUS, "--dict-full", FIXTURE_DICT,
                 "--work", tmp, "--segmenter", "preseg",
             ]), 1)
             self.assertIn("<unknown>", segmented)
@@ -346,7 +330,7 @@ class PipelineTests(unittest.TestCase):
     def test_arpa_headers_are_the_slmpack_dialect(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(main([
-                "all", "--xml", FIXTURE_XML, "--dict-full", FIXTURE_DICT,
+                "all", "--corpus", FIXTURE_CORPUS, "--dict-full", FIXTURE_DICT,
                 "--dict-head", DICT_HEAD, "--work", tmp, "--max-keys", "8",
             ] + FIXTURE_ESTIMATE), 0)
             text = _read(os.path.join(tmp, "lm_sc.3gm.arpa"))
@@ -392,7 +376,7 @@ class SlmpackTests(unittest.TestCase):
     def test_fixture_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(main([
-                "all", "--xml", FIXTURE_XML, "--dict-full", FIXTURE_DICT,
+                "all", "--corpus", FIXTURE_CORPUS, "--dict-full", FIXTURE_DICT,
                 "--dict-head", DICT_HEAD, "--work", tmp, "--max-keys", "4",
             ] + FIXTURE_ESTIMATE), 0)
             arpa_path = os.path.join(tmp, "lm_sc.3gm.arpa")

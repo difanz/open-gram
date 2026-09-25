@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Driver for dict.utf8 and lm_sc.3gm.arpa.
 
-Stages, in order: dict, text, segment, counts, arpa.
-``all`` runs that sequence. The caller supplies the lexicon and the corpus
-files.
+Stages, in order: dict, segment, counts, arpa.
+``all`` runs that sequence on a sentence corpus, one sentence per line.
+Source converters live under ``importers/`` and are not part of this driver.
 
 Binary packing remains in sunpinyin (slmpack, slmthread, tslmendian, genpyt).
 """
@@ -26,7 +26,6 @@ from pipeline.arpa import (
 from pipeline.lexicon_build import build_dict_utf8, default_dict_head
 from pipeline.ngram_count import count_segmented, write_surface_counts
 from pipeline.segment import segment_file
-from pipeline.wiki_text import dumps_to_sentences
 
 
 def _order(value):
@@ -101,10 +100,6 @@ def build_parser():
     dict_p = sub.add_parser("dict")
     _add_dict_args(dict_p, True)
 
-    text_p = sub.add_parser("text")
-    text_p.add_argument("--xml", action="append", required=True)
-    text_p.add_argument("--output", required=True)
-
     seg_p = sub.add_parser("segment")
     seg_p.add_argument("--dict", required=True, help="dict.utf8")
     seg_p.add_argument("--input", required=True)
@@ -127,7 +122,8 @@ def build_parser():
     _add_estimate_args(arpa_p)
 
     all_p = sub.add_parser("all")
-    all_p.add_argument("--xml", action="append", required=True)
+    all_p.add_argument("--corpus", action="append", required=True,
+                       help="sentence file, one sentence per line")
     all_p.add_argument("--dict-full", required=True)
     all_p.add_argument("--dict-head", default=default_dict_head())
     all_p.add_argument("--work", required=True)
@@ -148,6 +144,21 @@ def _merged_dir(counts_dir):
     return counts_dir
 
 
+def _copy_corpus(paths, dest):
+    """Copy sentence files through unchanged. Returns the number of non-empty lines."""
+    count = 0
+    with open(dest, "w", encoding="utf-8") as out:
+        for path in paths:
+            with open(path, "r", encoding="utf-8") as src:
+                for line in src:
+                    out.write(line)
+                    if not line.endswith("\n"):
+                        out.write("\n")
+                    if line.strip():
+                        count += 1
+    return count
+
+
 def run_all(args):
     if args.segmenter == "preseg":
         raise ValueError(
@@ -161,7 +172,7 @@ def run_all(args):
     counts_dir = os.path.join(work, "counts")
     arpa_path = os.path.join(work, "lm_sc.3gm.arpa")
     build_dict_utf8(args.dict_full, dict_path, args.dict_head)
-    nsent = dumps_to_sentences(args.xml, sentences)
+    nsent = _copy_corpus(args.corpus, sentences)
     segment_file(
         sentences, segmented, dict_path,
         segmenter=args.segmenter, crf_model=args.crf_model,
@@ -187,8 +198,6 @@ def main(argv=None):
     try:
         if args.stage == "dict":
             build_dict_utf8(args.dict_full, args.output, args.dict_head)
-        elif args.stage == "text":
-            dumps_to_sentences(args.xml, args.output)
         elif args.stage == "segment":
             segment_file(
                 args.input, args.output, args.dict,
