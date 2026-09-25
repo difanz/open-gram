@@ -1,4 +1,4 @@
-.PHONY: all test fetch release clean
+.PHONY: all test release clean
 
-all test fetch release clean:
+all test release clean:
 	$(MAKE) -C pipeline $@

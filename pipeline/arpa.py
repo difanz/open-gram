@@ -1,5 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Absolute-discount trigram in the text dialect read by slmpack.
+"""Trigram ARPA text in the dialect read by slmpack.
+
+Discounting follows CSlmBuilder. Each order has a cutoff and one
+Good-Turing, absolute, or linear discounter. A count at or below the
+cutoff is dropped, unless that gram still has a kept extension.
+Good-Turing stores nr[r] = r * N_r and discounts frequencies below R;
+at R and above the count is multiplied by the high-frequency factor.
+Absolute discount uses r' = r - c, and c <= 0 selects
+nr[1] / (nr[1] + 2 * nr[2]). A breaker id may start or end an n-gram
+and is not stored in the interior. An exclude id is omitted from every
+gram that contains it. Level 0 is the uniform 1/|V|. The backoff weight
+is (1 - Σ child pr) / (1 - Σ getPr(suffix)).
 
 CArpaSlm stores direct probabilities, not -log(pr). The file has four
 sections:
@@ -18,15 +29,9 @@ followed by one space and each probability is written with %20.17f, which
 is that separator for values in [0, 10). Rows are sorted by word id
 because initChild() binary-searches that order.
 
-Unigrams are maximum likelihood. Orders 2 and 3 use absolute discount.
-The history count is the number of in-sentence continuations, not the
-marginal count of the shorter gram. Level 0 is the empty history: an id
-with no unigram row scores root_bow * ROOT_PR in getPrDirect.
-
 Sections above the requested order are still emitted, empty, so the
 trigram reader always sees four headers. Trigram rows are streamed from
-the count file. Bigram conditional probabilities stay in sqlite so the
-trigram backoff does not require a second copy of the leaf counts.
+the count file. Bigram rows stay in sqlite.
 """
 
 from __future__ import annotations
@@ -38,103 +43,266 @@ from pipeline.lexicon_io import load_dict_utf8
 from pipeline.ngram_count import iter_ng
 
 SLMPACK_ORDER = 3
-ROOT_PR = 1e-8
-DEFAULT_DISCOUNT = 0.5
+SLM_MAX_R = 16
+# slmbuild example: -c 0,3,2 -d GT,8,0.9995 -d ABS -d ABS -b 10 -e 9
+# 10 is <stok>, 9 is <amigu> in dict_head.utf8.
+DEFAULT_CUTS = (0, 3, 2)
+DEFAULT_BREAKERS = (10,)
+DEFAULT_EXCLUDES = (9,)
 # CArpaSlm reads each row with getline(buf, 1024). That stores at most
 # 1023 bytes and fails unless the newline falls inside the window, so the
 # payload itself is limited to 1022 bytes.
 _GETLINE_PAYLOAD = 1022
 
 
-def discount_history(pairs, discount, lower_of):
-    """Absolute discount for one history.
+class GTDiscounter:
+    """Good-Turing for r < R, then r' = r * high_dis.
 
-    ``pairs`` is a list of ``(word_id, count)``. ``lower_of(word_id)`` is
-    the lower-order probability of that word in the backoff context.
-    Returns ``(explicit_pr, bow)``. An empty extension list has backoff
-    weight 1.
+    nr[r] stores r * N_r, as CSlmBuilder::CountNr does. The ratio
+    nr[r+1]/nr[r] is therefore (r+1) N_{r+1} / (r N_r), and r times that
+    ratio is the Good-Turing r*.
     """
-    if discount < 0.0 or discount >= 1.0:
-        raise ValueError("discount must be in [0, 1), got %r" % (discount,))
-    if not pairs:
-        return {}, 1.0
-    hist_count = float(sum(count for _word, count in pairs))
-    explicit = {}
-    for word, count in pairs:
-        pr = (count - discount) / hist_count
-        if pr > 0.0:
-            explicit[word] = pr
-    alpha = 1.0 - sum(explicit.values())
-    if alpha < 0.0:
-        alpha = 0.0
-    lower_sum = 0.0
-    for word in explicit:
-        lower_sum += lower_of(word)
-    denom = 1.0 - lower_sum
-    if alpha <= 1e-12:
-        bow = 0.0
-    elif denom <= 1e-12:
-        bow = 1.0
-    else:
-        bow = alpha / denom
-    if bow < 0.0:
-        bow = 0.0
-    return explicit, bow
+
+    def __init__(self, threshold=8, high_dis=0.9995):
+        self.threshold = int(threshold)
+        self.high_dis = float(high_dis)
+        self.dis = None
+        self.thres = self.threshold
+
+    def init(self, nr):
+        n = SLM_MAX_R - 1
+        self.dis = [0.0] * n
+        self.thres = self.threshold if self.threshold <= n else n
+        for freq in range(1, n):
+            nxt = nr[freq + 1] if freq + 1 < len(nr) else 0
+            if nr[freq] == 0 or nxt == 0:
+                self.dis[freq] = 1.0
+            else:
+                self.dis[freq] = float(nxt) / float(nr[freq])
+
+    def discount(self, freq):
+        factor = self.dis[freq] if freq < self.thres else self.high_dis
+        new_freq = freq * factor
+        if new_freq >= float(freq):
+            new_freq = freq * self.high_dis
+        return new_freq
 
 
-def estimate_tables(counts, discount=DEFAULT_DISCOUNT):
-    """In-memory estimate. ``counts[n]`` maps an id tuple to a count.
+class ABSDiscounter:
+    """Absolute discount. c <= 0 selects n1 / (n1 + 2 n2) from nr[]."""
 
-    Used to check the streaming writer. ``write_arpa()`` does not hold
-    the trigram table.
+    def __init__(self, c=0.0):
+        self.c = float(c)
+
+    def init(self, nr):
+        if self.c <= 0.0:
+            denom = float(nr[1]) + 2.0 * float(nr[2])
+            self.c = (float(nr[1]) / denom) if denom > 0.0 else 0.0
+
+    def discount(self, freq):
+        if freq <= 0:
+            return 0.0
+        return freq - self.c
+
+
+class LINDiscounter:
+    """Linear discount. A factor outside (0, 1) selects 1 - nr[1]/nr[0]."""
+
+    def __init__(self, dis=0.0):
+        self.dis = float(dis)
+
+    def init(self, nr):
+        if self.dis <= 0.0 or self.dis >= 1.0:
+            self.dis = 1.0 - (float(nr[1]) / float(nr[0])) if nr[0] else 1.0
+
+    def discount(self, freq):
+        return freq * self.dis
+
+
+def default_discounts():
+    return (GTDiscounter(8, 0.9995), ABSDiscounter(0.0), ABSDiscounter(0.0))
+
+
+def parse_discount(text):
+    """Parse one slmbuild ``-d`` argument: GT,R,dis | ABS[,c] | LIN[,d]."""
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if not parts:
+        raise ValueError("empty discount specification")
+    kind = parts[0].upper()
+    if kind == "GT":
+        if len(parts) != 3:
+            raise ValueError("GT discount needs R and dis, e.g. GT,8,0.9995")
+        return GTDiscounter(int(parts[1]), float(parts[2]))
+    if kind == "ABS":
+        return ABSDiscounter(float(parts[1]) if len(parts) > 1 else 0.0)
+    if kind == "LIN":
+        return LINDiscounter(float(parts[1]) if len(parts) > 1 else 0.0)
+    raise ValueError("unknown discount %r" % (text,))
+
+
+def _nr_add(nr, freq):
+    nr[0] += freq
+    if 0 < freq < SLM_MAX_R:
+        nr[freq] += freq
+
+
+def _admit(gram, breakers, excludes):
+    """Breaker ids may end an n-gram. They are dropped from the interior.
+
+    An exclude id removes every n-gram that contains it. This is the
+    effect of CSlmBuilder::AddNGram stopping at those ids.
     """
-    probs = {}
-    bows = {(): 1.0}
-    total = sum(counts[1].values()) if counts[1] else 0
-    if total:
-        inv = 1.0 / float(total)
-        for gram, count in counts[1].items():
-            probs[gram] = count * inv
-            bows[gram] = 1.0
-    grouped = {}
-    for gram, count in counts[2].items():
-        grouped.setdefault(gram[:-1], []).append((gram[-1], count))
-    for hist, pairs in grouped.items():
-        explicit, bow = discount_history(
-            pairs, discount, lambda word, _probs=probs: _probs[(word,)]
-        )
-        bows[hist] = bow
-        for word, pr in explicit.items():
-            gram = hist + (word,)
-            probs[gram] = pr
-            bows[gram] = 1.0
-    grouped = {}
-    for gram, count in counts[3].items():
-        grouped.setdefault(gram[:-1], []).append((gram[-1], count))
-    for hist, pairs in grouped.items():
-        suffix = hist[1:]
-
-        def lower(word, _suffix=suffix, _probs=probs):
-            return _probs[_suffix + (word,)]
-
-        explicit, bow = discount_history(pairs, discount, lower)
-        bows[hist] = bow
-        for word, pr in explicit.items():
-            probs[hist + (word,)] = pr
-    for gram in list(probs):
-        if len(gram) < SLMPACK_ORDER:
-            bows.setdefault(gram, 1.0)
-    return probs, bows
+    if any(wid in excludes for wid in gram):
+        return False
+    if len(gram) >= 3 and any(wid in breakers for wid in gram[1:-1]):
+        return False
+    return True
 
 
-def backoff_prob(gram, probs, bows, root_pr=ROOT_PR):
-    """getPrDirect: stored probability, else bow(history) times the shorter gram."""
-    if gram in probs:
-        return probs[gram]
-    if not gram:
+def _empty_nr():
+    return [[0] * SLM_MAX_R for _ in range(SLMPACK_ORDER + 1)]
+
+
+def node_bow(child_prs, lower_prs):
+    """CSlmBuilder::CalcNodeBow, direct probabilities."""
+    if not child_prs:
+        return 1.0
+    sumnext = float(sum(child_prs))
+    lower = float(sum(lower_prs))
+    if sumnext <= 0.0:
+        return 1.0
+    if sumnext >= 1.0 or lower >= 1.0:
+        base = max(sumnext, lower) + 0.0001
+        return (base - sumnext) / (base - lower)
+    return (1.0 - sumnext) / (1.0 - lower)
+
+
+def conditional_pr(discounter, freq, parent_freq):
+    """Discounted count over the history node's frequency.
+
+    CSlmBuilder asserts that this lies in (0, 1). A non-positive result,
+    or a result of 1 or more, is omitted instead of aborting.
+    """
+    if parent_freq <= 0:
+        return None
+    new_freq = discounter.discount(freq)
+    if new_freq <= 0.0:
+        return None
+    pr = new_freq / float(parent_freq)
+    if pr <= 0.0 or pr >= 1.0:
+        return None
+    return pr
+
+
+def builder_get_pr(words, lookup, bows, root_pr):
+    """CSlmBuilder::getPr.
+
+    The search loop increments the level after a failed child lookup, so
+    ``lvl == n - 1`` is the miss one step above the predicted word. A miss
+    on the predicted word itself recurses to the suffix without multiplying
+    that history's backoff weight.
+    """
+    n = len(words)
+    if n == 0:
         return root_pr
-    bow = bows.get(gram[:-1], 1.0)
-    return bow * backoff_prob(gram[1:], probs, bows, root_pr)
+    bow = 1.0
+    hist = ()
+    found = True
+    level = 0
+    pr = None
+    while found and level < n:
+        bow = bows.get(hist, 1.0)
+        hist = hist + (words[level],)
+        pr = lookup(hist)
+        found = pr is not None
+        level += 1
+    if found:
+        return pr
+    if level == n - 1:
+        return bow * builder_get_pr(words[1:], lookup, bows, root_pr)
+    return builder_get_pr(words[1:], lookup, bows, root_pr)
+
+
+def estimate_tables(counts, word_count, cuts=DEFAULT_CUTS, discounts=None,
+                    breakers=DEFAULT_BREAKERS, excludes=DEFAULT_EXCLUDES):
+    """In-memory CSlmBuilder estimate.
+
+    ``counts[n]`` maps an id tuple to a count. Node frequency is that
+    count. The unigram denominator is the sum of admitted unigram counts.
+    Returns ``(probs, bows, root_pr)``. ``write_arpa`` is the out-of-core
+    path and is checked against this function. ``init`` is called on each
+    discounter.
+    """
+    if word_count < 1:
+        raise ValueError("word count must be the lexicon size, at least 1")
+    discs = list(discounts) if discounts is not None else list(default_discounts())
+    if len(discs) != SLMPACK_ORDER or len(cuts) != SLMPACK_ORDER:
+        raise ValueError("need one cutoff and one discount per order")
+    breakers = frozenset(breakers)
+    excludes = frozenset(excludes)
+    kept_counts = [dict() for _ in range(SLMPACK_ORDER + 1)]
+    nr = _empty_nr()
+    for n in range(1, SLMPACK_ORDER + 1):
+        for gram, freq in counts[n].items():
+            if not _admit(gram, breakers, excludes):
+                continue
+            kept_counts[n][gram] = freq
+            _nr_add(nr[n], freq)
+    for disc, row in zip(discs, nr[1:]):
+        disc.init(row)
+
+    root_freq = nr[1][0]
+    root_pr = 1.0 / float(word_count)
+    probs = {}
+
+    def parent_freq(gram):
+        if len(gram) == 1:
+            return root_freq
+        return kept_counts[len(gram) - 1].get(gram[:-1], 0)
+
+    surviving = [set() for _ in range(SLMPACK_ORDER + 1)]
+    for gram, freq in kept_counts[3].items():
+        if freq > cuts[2]:
+            surviving[3].add(gram)
+    bi_prefix = {gram[:2] for gram in surviving[3]}
+    for gram, freq in kept_counts[2].items():
+        if freq > cuts[1] or gram in bi_prefix:
+            surviving[2].add(gram)
+    uni_prefix = {gram[:1] for gram in surviving[2]}
+    for gram, freq in kept_counts[1].items():
+        if freq > cuts[0] or gram in uni_prefix:
+            surviving[1].add(gram)
+
+    for n in range(1, SLMPACK_ORDER + 1):
+        for gram in surviving[n]:
+            pr = conditional_pr(discs[n - 1], kept_counts[n][gram], parent_freq(gram))
+            if pr is not None:
+                probs[gram] = pr
+
+    children = {}
+    for gram, pr in probs.items():
+        children.setdefault(gram[:-1], []).append((gram[-1], pr))
+    lookup = probs.get
+    bows = {}
+
+    def lower_pr(hist, word):
+        if not hist:
+            return root_pr
+        return builder_get_pr(hist[1:] + (word,), lookup, bows, root_pr)
+
+    root_children = children.get((), [])
+    bows[()] = node_bow(
+        [pr for _word, pr in root_children],
+        [lower_pr((), word) for word, _pr in root_children],
+    )
+    for length in (1, 2):
+        for hist in [gram for gram in probs if len(gram) == length]:
+            kids = children.get(hist, [])
+            bows[hist] = node_bow(
+                [pr for _word, pr in kids],
+                [lower_pr(hist, word) for word, _pr in kids],
+            )
+    return probs, bows, root_pr
 
 
 def format_prob(value):
@@ -160,7 +328,7 @@ def format_entry(words, pr, bow=None):
     return text
 
 
-def render_model(probs, bows, lexicon, root_pr=ROOT_PR):
+def render_model(probs, bows, lexicon, root_pr):
     lines = ["\\0-gram\\1", format_entry([], root_pr, bows.get((), 1.0))]
     for n in range(1, SLMPACK_ORDER + 1):
         grams = sorted(gram for gram in probs if len(gram) == n)
@@ -200,28 +368,55 @@ def _write_lines(path, lines):
             handle.write("\n")
 
 
+_SQL_BATCH = 10000
+
+
+def _executemany(conn, sql, rows):
+    pending = []
+    for row in rows:
+        pending.append(row)
+        if len(pending) >= _SQL_BATCH:
+            conn.executemany(sql, pending)
+            del pending[:]
+    if pending:
+        conn.executemany(sql, pending)
+
+
 def write_arpa(merged_dir, dict_utf8, output, order=SLMPACK_ORDER,
-               discount=DEFAULT_DISCOUNT, root_pr=ROOT_PR):
+               cuts=DEFAULT_CUTS, discounts=None,
+               breakers=DEFAULT_BREAKERS, excludes=DEFAULT_EXCLUDES,
+               word_count=None):
+    """Stream merged counts into text ARPA.
+
+    Unigrams stay in a dict. Bigrams stay in sqlite. Trigrams are read
+    twice and are not retained. The probabilities match ``estimate_tables``.
+    """
     if order < 1 or order > SLMPACK_ORDER:
         raise ValueError("order must be in 1..%d" % SLMPACK_ORDER)
+    discs = list(discounts) if discounts is not None else list(default_discounts())
+    cuts = tuple(cuts)
+    if len(discs) != order or len(cuts) != order:
+        raise ValueError("need one cutoff and one discount per order")
+    breakers = frozenset(breakers)
+    excludes = frozenset(excludes)
     lexicon = load_dict_utf8(dict_utf8)
+    if word_count is None:
+        word_count = len(lexicon.word_to_id)
+    if word_count < 1:
+        raise ValueError("word count must be the lexicon size, at least 1")
     parent = os.path.dirname(os.path.abspath(output))
     if parent:
         os.makedirs(parent, exist_ok=True)
     body = os.path.join(merged_dir, "arpa-body")
     os.makedirs(body, exist_ok=True)
 
-    uni_pr = {}
-    uni_bow = {}
-    total = 0
-    for gram, count in iter_ng(os.path.join(merged_dir, "1.ng")):
-        uni_pr[gram[0]] = count
-        total += count
-    if total:
-        inv = 1.0 / float(total)
-        for wid in list(uni_pr):
-            uni_pr[wid] *= inv
-            uni_bow[wid] = 1.0
+    nr = _empty_nr()
+    uni_freq = {}
+    for gram, freq in iter_ng(os.path.join(merged_dir, "1.ng")):
+        if not _admit(gram, breakers, excludes):
+            continue
+        uni_freq[gram[0]] = freq
+        _nr_add(nr[1], freq)
 
     db_path = os.path.join(merged_dir, "bigram.sqlite")
     if os.path.exists(db_path):
@@ -230,64 +425,174 @@ def write_arpa(merged_dir, dict_utf8, output, order=SLMPACK_ORDER,
     try:
         conn.execute(
             "CREATE TABLE bi ("
-            "w1 INTEGER NOT NULL, w2 INTEGER NOT NULL, pr REAL NOT NULL, "
-            "bow REAL NOT NULL, PRIMARY KEY (w1, w2))"
+            "w1 INTEGER NOT NULL, w2 INTEGER NOT NULL, freq INTEGER NOT NULL, "
+            "pr REAL, bow REAL NOT NULL DEFAULT 1.0, has_child INTEGER NOT NULL "
+            "DEFAULT 0, PRIMARY KEY (w1, w2))"
         )
         if order >= 2:
-            def lower_uni(word):
-                try:
-                    return uni_pr[word]
-                except KeyError:
-                    raise RuntimeError(
-                        "bigram continuation id %d has no unigram count" % word
-                    ) from None
+            def bigram_rows():
+                for gram, freq in iter_ng(os.path.join(merged_dir, "2.ng")):
+                    if not _admit(gram, breakers, excludes):
+                        continue
+                    _nr_add(nr[2], freq)
+                    yield (gram[0], gram[1], freq)
 
-            for hist, pairs in _group_sorted(
-                    iter_ng(os.path.join(merged_dir, "2.ng")), 1):
-                explicit, bow = discount_history(pairs, discount, lower_uni)
-                uni_bow[hist[0]] = bow
-                conn.executemany(
-                    "INSERT INTO bi (w1, w2, pr, bow) VALUES (?, ?, ?, 1.0)",
-                    [(hist[0], word, pr) for word, pr in explicit.items()],
+            _executemany(
+                conn,
+                "INSERT INTO bi (w1, w2, freq) VALUES (?, ?, ?)",
+                bigram_rows(),
+            )
+        if order >= 3:
+            conn.execute(
+                "CREATE TABLE hist ("
+                "w1 INTEGER NOT NULL, w2 INTEGER NOT NULL, "
+                "PRIMARY KEY (w1, w2))"
+            )
+
+            def trigram_histories():
+                for gram, freq in iter_ng(os.path.join(merged_dir, "3.ng")):
+                    if not _admit(gram, breakers, excludes):
+                        continue
+                    _nr_add(nr[3], freq)
+                    if freq > cuts[2]:
+                        yield (gram[0], gram[1])
+
+            _executemany(
+                conn,
+                "INSERT OR IGNORE INTO hist (w1, w2) VALUES (?, ?)",
+                trigram_histories(),
+            )
+            missing = conn.execute(
+                "SELECT COUNT(*) FROM hist AS h LEFT JOIN bi "
+                "ON bi.w1 = h.w1 AND bi.w2 = h.w2 WHERE bi.w1 IS NULL"
+            ).fetchone()[0]
+            if missing:
+                raise RuntimeError(
+                    "%d trigram histories are missing from the bigram counts"
+                    % missing
                 )
+            conn.execute(
+                "UPDATE bi SET has_child = 1 WHERE (w1, w2) IN "
+                "(SELECT w1, w2 FROM hist)"
+            )
+            conn.execute("DROP TABLE hist")
+        conn.commit()
+
+        for index in range(order):
+            discs[index].init(nr[index + 1])
+        root_freq = nr[1][0]
+        root_pr = 1.0 / float(word_count)
+
+        prefix_uni = set()
+        if order >= 2:
+            for (wid,) in conn.execute(
+                    "SELECT DISTINCT w1 FROM bi WHERE freq > ? OR has_child = 1",
+                    (cuts[1],)):
+                prefix_uni.add(wid)
+        uni_pr = {}
+        for wid, freq in uni_freq.items():
+            if freq > cuts[0] or wid in prefix_uni:
+                pr = conditional_pr(discs[0], freq, root_freq)
+                if pr is not None:
+                    uni_pr[wid] = pr
+        if order >= 2:
+            def bigram_prs():
+                for w1, w2, freq in conn.execute(
+                        "SELECT w1, w2, freq FROM bi "
+                        "WHERE freq > ? OR has_child = 1",
+                        (cuts[1],)):
+                    pr = conditional_pr(discs[1], freq, uni_freq.get(w1, 0))
+                    if pr is not None:
+                        yield (pr, w1, w2)
+
+            _executemany(
+                conn,
+                "UPDATE bi SET pr = ? WHERE w1 = ? AND w2 = ?",
+                bigram_prs(),
+            )
             conn.commit()
+
+        bows = {}
+        bows[()] = node_bow(list(uni_pr.values()), [root_pr] * len(uni_pr))
+        uni_bow = {wid: 1.0 for wid in uni_pr}
+
+        def lookup(gram):
+            if len(gram) == 1:
+                return uni_pr.get(gram[0])
+            if len(gram) == 2:
+                row = conn.execute(
+                    "SELECT pr FROM bi WHERE w1 = ? AND w2 = ?",
+                    (gram[0], gram[1]),
+                ).fetchone()
+                if row is None:
+                    return None
+                return row[0]
+            return None
+
+        if order >= 2 and uni_pr:
+            current = None
+            child_prs = []
+            lower = []
+
+            def flush_unigram(wid):
+                if wid is None or wid not in uni_pr:
+                    return
+                uni_bow[wid] = node_bow(child_prs, lower)
+
+            for w1, w2, pr in conn.execute(
+                    "SELECT w1, w2, pr FROM bi WHERE pr IS NOT NULL "
+                    "ORDER BY w1, w2"):
+                if w1 != current:
+                    flush_unigram(current)
+                    current = w1
+                    child_prs = []
+                    lower = []
+                child_prs.append(pr)
+                lower.append(builder_get_pr((w2,), lookup, bows, root_pr))
+            flush_unigram(current)
+        for wid, bow in uni_bow.items():
+            bows[(wid,)] = bow
 
         tri_path = os.path.join(body, "3")
         with open(tri_path, "w", encoding="utf-8") as tri_out:
             if order >= 3:
-                def lower_bi(w2, w3):
-                    row = conn.execute(
-                        "SELECT pr FROM bi WHERE w1=? AND w2=?", (w2, w3)
-                    ).fetchone()
-                    if row is None:
-                        raise RuntimeError(
-                            "trigram suffix (%d, %d) has no bigram probability"
-                            % (w2, w3)
-                        )
-                    return row[0]
-
                 for hist, pairs in _group_sorted(
                         iter_ng(os.path.join(merged_dir, "3.ng")), 2):
-                    w2 = hist[1]
-
-                    def lower(word, _w2=w2):
-                        return lower_bi(_w2, word)
-
-                    explicit, bow = discount_history(pairs, discount, lower)
-                    found = conn.execute(
-                        "SELECT 1 FROM bi WHERE w1=? AND w2=?",
+                    kept = []
+                    for word, freq in pairs:
+                        gram = hist + (word,)
+                        if freq > cuts[2] and _admit(gram, breakers, excludes):
+                            kept.append((word, freq))
+                    if not kept:
+                        continue
+                    parent_row = conn.execute(
+                        "SELECT freq FROM bi WHERE w1 = ? AND w2 = ?",
                         (hist[0], hist[1]),
                     ).fetchone()
-                    if found is None:
+                    if parent_row is None:
                         raise RuntimeError(
-                            "trigram history %r is missing from the bigram table"
+                            "trigram history %r is missing from the bigram counts"
                             % (hist,)
                         )
+                    child_prs = []
+                    lower = []
+                    emitted = []
+                    for word, freq in kept:
+                        pr = conditional_pr(discs[2], freq, parent_row[0])
+                        if pr is None:
+                            continue
+                        child_prs.append(pr)
+                        lower.append(builder_get_pr(
+                            (hist[1], word), lookup, bows, root_pr,
+                        ))
+                        emitted.append((word, pr))
+                    if not emitted:
+                        continue
                     conn.execute(
-                        "UPDATE bi SET bow=? WHERE w1=? AND w2=?",
-                        (bow, hist[0], hist[1]),
+                        "UPDATE bi SET bow = ? WHERE w1 = ? AND w2 = ?",
+                        (node_bow(child_prs, lower), hist[0], hist[1]),
                     )
-                    for word, pr in sorted(explicit.items()):
+                    for word, pr in emitted:
                         words = (
                             lexicon.surface(hist[0]),
                             lexicon.surface(hist[1]),
@@ -309,7 +614,8 @@ def write_arpa(merged_dir, dict_utf8, output, order=SLMPACK_ORDER,
         with open(bi_path, "w", encoding="utf-8") as bi_out:
             if order >= 2:
                 for w1, w2, pr, bow in conn.execute(
-                        "SELECT w1, w2, pr, bow FROM bi ORDER BY w1, w2"):
+                        "SELECT w1, w2, pr, bow FROM bi WHERE pr IS NOT NULL "
+                        "ORDER BY w1, w2"):
                     bi_out.write(format_entry(
                         (lexicon.surface(w1), lexicon.surface(w2)), pr, bow
                     ))
@@ -319,7 +625,7 @@ def write_arpa(merged_dir, dict_utf8, output, order=SLMPACK_ORDER,
 
     with open(output, "w", encoding="utf-8") as out:
         out.write("\\0-gram\\1\n")
-        out.write(format_entry([], root_pr, 1.0))
+        out.write(format_entry([], root_pr, bows.get((), 1.0)))
         out.write("\n")
         for level, path in ((1, uni_path), (2, bi_path), (3, tri_path)):
             _append_section(out, level, path)

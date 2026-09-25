@@ -2,8 +2,8 @@
 """Driver for dict.utf8 and lm_sc.3gm.arpa.
 
 Stages, in order: dict, text, segment, counts, arpa.
-``all`` runs that sequence. ``fetch`` downloads the given URLs and does
-not select a corpus.
+``all`` runs that sequence. The caller supplies the lexicon and the corpus
+files.
 
 Binary packing remains in sunpinyin (slmpack, slmthread, tslmendian, genpyt).
 """
@@ -14,11 +14,18 @@ import argparse
 import os
 import sys
 
-from pipeline.arpa import DEFAULT_DISCOUNT, SLMPACK_ORDER, write_arpa
+from pipeline.arpa import (
+    DEFAULT_BREAKERS,
+    DEFAULT_CUTS,
+    DEFAULT_EXCLUDES,
+    SLMPACK_ORDER,
+    default_discounts,
+    parse_discount,
+    write_arpa,
+)
 from pipeline.lexicon_build import build_dict_utf8, default_dict_head
 from pipeline.ngram_count import count_segmented, write_surface_counts
 from pipeline.segment import segment_file
-from pipeline.sources import fetch_url
 from pipeline.wiki_text import dumps_to_sentences
 
 
@@ -27,6 +34,58 @@ def _order(value):
     if order < 1 or order > SLMPACK_ORDER:
         raise argparse.ArgumentTypeError("order must be in 1..%d" % SLMPACK_ORDER)
     return order
+
+
+def _cut_list(text):
+    try:
+        cuts = tuple(int(part) for part in text.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("cutoffs must be integers") from exc
+    if not cuts:
+        raise argparse.ArgumentTypeError("cutoff list is empty")
+    return cuts
+
+
+def _id_list(text):
+    text = text.strip()
+    if not text:
+        return ()
+    try:
+        return tuple(int(part) for part in text.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("word ids must be integers") from exc
+
+
+def _add_estimate_args(parser):
+    parser.add_argument("--order", type=_order, default=SLMPACK_ORDER)
+    parser.add_argument("--cut", type=_cut_list, default=DEFAULT_CUTS,
+                        help="per-order cutoffs; drop a count at or below its cutoff")
+    parser.add_argument("--discount", action="append",
+                        help="GT,R,dis or ABS[,c] or LIN[,d], once per order")
+    parser.add_argument("--breaker", type=_id_list, default=DEFAULT_BREAKERS)
+    parser.add_argument("--exclude", type=_id_list, default=DEFAULT_EXCLUDES)
+    parser.add_argument("--word-count", type=int,
+                        help="lexicon size used for the level-0 probability")
+
+
+def _estimate_kwargs(args):
+    if args.discount:
+        discounts = tuple(parse_discount(item) for item in args.discount)
+    else:
+        discounts = default_discounts()
+    if len(discounts) != args.order or len(args.cut) != args.order:
+        raise ValueError(
+            "order %d needs %d cutoffs and %d discount methods"
+            % (args.order, args.order, args.order)
+        )
+    return {
+        "order": args.order,
+        "cuts": args.cut,
+        "discounts": discounts,
+        "breakers": args.breaker,
+        "excludes": args.exclude,
+        "word_count": args.word_count,
+    }
 
 
 def _add_dict_args(parser, full_required):
@@ -65,8 +124,7 @@ def build_parser():
     arpa_p.add_argument("--dict", required=True, help="dict.utf8")
     arpa_p.add_argument("--counts", required=True, help="directory written by the counts stage")
     arpa_p.add_argument("--output", required=True)
-    arpa_p.add_argument("--order", type=_order, default=SLMPACK_ORDER)
-    arpa_p.add_argument("--discount", type=float, default=DEFAULT_DISCOUNT)
+    _add_estimate_args(arpa_p)
 
     all_p = sub.add_parser("all")
     all_p.add_argument("--xml", action="append", required=True)
@@ -75,15 +133,10 @@ def build_parser():
     all_p.add_argument("--work", required=True)
     all_p.add_argument("--segmenter", choices=("match", "preseg", "crf"), default="match")
     all_p.add_argument("--crf-model")
-    all_p.add_argument("--order", type=_order, default=SLMPACK_ORDER)
-    all_p.add_argument("--discount", type=float, default=DEFAULT_DISCOUNT)
+    _add_estimate_args(all_p)
     all_p.add_argument("--max-keys", type=int, default=2000000)
     all_p.add_argument("--surface", action="store_true",
                        help="also write work/counts.tsv")
-
-    fetch_p = sub.add_parser("fetch")
-    fetch_p.add_argument("--dest", required=True)
-    fetch_p.add_argument("--url", action="append", required=True)
 
     return parser
 
@@ -108,7 +161,7 @@ def run_all(args):
     counts_dir = os.path.join(work, "counts")
     arpa_path = os.path.join(work, "lm_sc.3gm.arpa")
     build_dict_utf8(args.dict_full, dict_path, args.dict_head)
-    nsent, script = dumps_to_sentences(args.xml, sentences)
+    nsent = dumps_to_sentences(args.xml, sentences)
     segment_file(
         sentences, segmented, dict_path,
         segmenter=args.segmenter, crf_model=args.crf_model,
@@ -121,13 +174,10 @@ def run_all(args):
         write_surface_counts(
             merged, dict_path, os.path.join(work, "counts.tsv"), order=args.order,
         )
-    write_arpa(
-        merged, dict_path, arpa_path,
-        order=args.order, discount=args.discount,
-    )
+    write_arpa(merged, dict_path, arpa_path, **_estimate_kwargs(args))
     sys.stderr.write(
-        "dict %s\nsentences %d (%s)\nsegmented %s\ncounts %s\narpa %s\n"
-        % (dict_path, nsent, script, segmented, merged, arpa_path)
+        "dict %s\nsentences %d\nsegmented %s\ncounts %s\narpa %s\n"
+        % (dict_path, nsent, segmented, merged, arpa_path)
     )
     return 0
 
@@ -154,13 +204,10 @@ def main(argv=None):
         elif args.stage == "arpa":
             write_arpa(
                 _merged_dir(args.counts), args.dict, args.output,
-                order=args.order, discount=args.discount,
+                **_estimate_kwargs(args),
             )
         elif args.stage == "all":
             return run_all(args)
-        elif args.stage == "fetch":
-            for url in args.url:
-                fetch_url(url, args.dest)
         else:
             raise RuntimeError("unhandled stage %s" % args.stage)
     except (OSError, ValueError, KeyError, RuntimeError, PermissionError) as exc:

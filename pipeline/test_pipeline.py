@@ -16,7 +16,6 @@ sys.path.insert(0, ROOT)
 from pipeline import arpa
 from pipeline import ngram_count
 from pipeline import segment
-from pipeline import sources
 from pipeline import wiki_text
 from pipeline.lexicon_build import build_dict_utf8, default_dict_head
 from pipeline.lexicon_io import Lexicon, load_dict_utf8
@@ -34,14 +33,18 @@ FIXTURE_DICT = os.path.join(HERE, "testdata", "dict.full")
 DICT_HEAD = default_dict_head()
 DATA_DICT = os.path.join(ROOT, "data", "dict.full")
 SORT_ARPA = os.path.join(ROOT, "tools", "utils", "sort-arpa.py")
+# The fixture counts are too small for the release cutoffs and for
+# automatic absolute discount, which subtracts about 1 from a count of 1.
+FIXTURE_ESTIMATE = [
+    "--cut", "0,0,0",
+    "--discount", "ABS,0.5",
+    "--discount", "ABS,0.5",
+    "--discount", "ABS,0.5",
+]
 
 
-class FetchTests(unittest.TestCase):
-    def test_local_name_is_the_url_basename(self):
-        url = "https://dumps.wikimedia.org/zhwiki/latest/zhwiki-latest-pages-articles.xml.bz2"
-        self.assertEqual(sources.local_name(url), "zhwiki-latest-pages-articles.xml.bz2")
-        with self.assertRaises(ValueError):
-            sources.local_name("https://dumps.wikimedia.org/zhwiki/latest/")
+def _abs_discounts():
+    return tuple(arpa.ABSDiscounter(0.5) for _ in range(3))
 
 
 class WikiTextTests(unittest.TestCase):
@@ -57,17 +60,6 @@ class WikiTextTests(unittest.TestCase):
         blob = "\n".join(sentences)
         for marker in ("[[", "]]", "{{", "}}", "Category", "注", "不应", "REDIRECT", "参见"):
             self.assertNotIn(marker, blob)
-
-    def test_traditional_without_opencc_is_refused(self):
-        if shutil.which("opencc"):
-            self.skipTest("opencc is installed; identity refusal is not the active path")
-        with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(tmp, "trad.txt")
-            dst = os.path.join(tmp, "out.txt")
-            with open(src, "w", encoding="utf-8") as handle:
-                handle.write("他們。\n")
-            with self.assertRaises(RuntimeError):
-                wiki_text.simplify_file(src, dst)
 
 
 class LexiconTests(unittest.TestCase):
@@ -146,6 +138,26 @@ class CountAndArpaTests(unittest.TestCase):
             lexicon.add(word, wid)
         return lexicon
 
+    def test_good_turing_and_absolute_init(self):
+        nr = [0] * arpa.SLM_MAX_R
+        nr[1] = 4
+        nr[2] = 2
+        gt = arpa.GTDiscounter(8, 0.5)
+        gt.init(nr)
+        # r* = (r + 1) N_{r+1} / N_r = 2 * 1 / 4.
+        self.assertTrue(math.isclose(gt.discount(1), 0.5))
+        # nr[3] is empty, so the ratio is replaced by the high-frequency factor.
+        self.assertTrue(math.isclose(gt.discount(2), 1.0))
+        self.assertTrue(math.isclose(gt.discount(9), 4.5))
+        absolute = arpa.ABSDiscounter(0.0)
+        absolute.init(nr)
+        self.assertTrue(math.isclose(absolute.c, 4.0 / (4.0 + 2.0 * 2.0)))
+        linear = arpa.LINDiscounter(0.0)
+        nr[0] = 10
+        linear.init(nr)
+        self.assertTrue(math.isclose(linear.dis, 1.0 - 4.0 / 10.0))
+        self.assertTrue(math.isclose(linear.discount(5), 3.0))
+
     def test_absolute_discount_matches_hand_count(self):
         lexicon = self._lexicon()
         wo, ai, bj, zg = (lexicon.require(w) for w in ("我", "爱", "北京", "中国"))
@@ -153,19 +165,59 @@ class CountAndArpaTests(unittest.TestCase):
         counts[1] = {(wo,): 2, (ai,): 2, (bj,): 1, (zg,): 1}
         counts[2] = {(wo, ai): 2, (ai, bj): 1, (ai, zg): 1}
         counts[3] = {(wo, ai, bj): 1, (wo, ai, zg): 1}
-        probs, bows = arpa.estimate_tables(counts, discount=0.5)
-        self.assertTrue(math.isclose(probs[(wo,)], 2.0 / 6.0))
+        probs, bows, root_pr = arpa.estimate_tables(
+            counts, word_count=5, cuts=(0, 0, 0), discounts=_abs_discounts(),
+            breakers=(), excludes=(),
+        )
+        self.assertTrue(math.isclose(root_pr, 0.2))
+        self.assertTrue(math.isclose(probs[(wo,)], 1.5 / 6.0))
+        self.assertTrue(math.isclose(probs[(bj,)], 0.5 / 6.0))
         self.assertTrue(math.isclose(probs[(wo, ai)], 0.75))
-        self.assertTrue(math.isclose(bows[(wo,)], 0.375))
-        self.assertTrue(math.isclose(bows[(ai,)], 0.75))
+        self.assertTrue(math.isclose(probs[(ai, bj)], 0.25))
+        self.assertTrue(math.isclose(bows[(wo,)], 1.0 / 3.0))
+        self.assertTrue(math.isclose(bows[(ai,)], 0.6))
         self.assertTrue(math.isclose(bows[(bj,)], 1.0))
         self.assertTrue(math.isclose(probs[(wo, ai, bj)], 0.25))
         self.assertTrue(math.isclose(bows[(wo, ai)], 1.0))
-        vocab = (wo, ai, bj, zg)
-        total = sum(arpa.backoff_prob((wo, wid), probs, bows) for wid in vocab)
-        self.assertTrue(math.isclose(total, 1.0, rel_tol=1e-9, abs_tol=1e-12))
+        self.assertTrue(math.isclose(bows[()], 5.0 / 3.0))
+        # CSlmBuilder::getPr increments past the failed lookup, so a missing
+        # final word does not multiply the history backoff weight.
         self.assertTrue(math.isclose(
-            arpa.backoff_prob((wo, bj), probs, bows), 0.375 * (1.0 / 6.0)))
+            arpa.builder_get_pr((wo, bj), probs.get, bows, root_pr),
+            probs[(bj,)],
+        ))
+
+    def test_cutoff_keeps_a_history_that_has_a_child(self):
+        counts = [dict() for _ in range(4)]
+        counts[1] = {(1,): 1, (2,): 5, (3,): 5}
+        counts[2] = {(1, 2): 1, (2, 3): 1}
+        counts[3] = {(1, 2, 3): 1}
+        probs, _bows, _root = arpa.estimate_tables(
+            counts, word_count=10, cuts=(2, 2, 0), discounts=_abs_discounts(),
+            breakers=(), excludes=(),
+        )
+        self.assertIn((1, 2), probs)
+        self.assertNotIn((2, 3), probs)
+        self.assertIn((1,), probs)
+        self.assertIn((1, 2, 3), probs)
+
+    def test_breaker_and_exclude(self):
+        counts = [dict() for _ in range(4)]
+        counts[1] = {(1,): 4, (2,): 4, (7,): 4, (9,): 4}
+        counts[2] = {(1, 7): 2, (7, 2): 2, (1, 9): 2, (1, 2): 2}
+        counts[3] = {(1, 7, 2): 2, (1, 2, 7): 2, (1, 9, 2): 2}
+        probs, _bows, _root = arpa.estimate_tables(
+            counts, word_count=20, cuts=(0, 0, 0), discounts=_abs_discounts(),
+            breakers=(7,), excludes=(9,),
+        )
+        self.assertNotIn((9,), probs)
+        self.assertNotIn((1, 9), probs)
+        self.assertNotIn((1, 9, 2), probs)
+        self.assertNotIn((1, 7, 2), probs)
+        self.assertIn((1, 7), probs)
+        self.assertIn((7,), probs)
+        self.assertIn((7, 2), probs)
+        self.assertIn((1, 2, 7), probs)
 
     def test_row_longer_than_slmpack_getline_is_rejected(self):
         word = "词" * 400
@@ -201,16 +253,24 @@ class CountAndArpaTests(unittest.TestCase):
             merged = os.path.join(tmp, "merged")
             ngram_count.merge_shards(os.path.join(tmp, "shards"), merged, 3)
             counts = ngram_count.load_counts(merged, 3)
-            probs, bows = arpa.estimate_tables(counts, discount=0.5)
-            expected = arpa.parse_arpa(arpa.render_model(probs, bows, lexicon))
-            # dict.utf8 for write_arpa.
+            probs, bows, root_pr = arpa.estimate_tables(
+                counts, word_count=5, cuts=(0, 0, 0), discounts=_abs_discounts(),
+                breakers=(), excludes=(),
+            )
+            expected = arpa.parse_arpa(arpa.render_model(probs, bows, lexicon, root_pr))
             dict_path = os.path.join(tmp, "dict.utf8")
             with open(dict_path, "w", encoding="utf-8") as handle:
                 for word, wid in (("我", wo), ("爱", ai), ("北京", bj), ("中国", zg), ("<unknown>", 0)):
                     handle.write("%s %d\n" % (word, wid))
             arpa_path = os.path.join(tmp, "lm_sc.3gm.arpa")
-            arpa.write_arpa(merged, dict_path, arpa_path, discount=0.5)
+            arpa.write_arpa(
+                merged, dict_path, arpa_path, cuts=(0, 0, 0),
+                discounts=_abs_discounts(), breakers=(), excludes=(),
+                word_count=5,
+            )
             got = arpa.parse_arpa(_read(arpa_path))
+            self.assertTrue(math.isclose(got["root"][1], expected["root"][1], rel_tol=1e-12, abs_tol=1e-15))
+            self.assertTrue(math.isclose(got["root"][2], expected["root"][2], rel_tol=1e-12, abs_tol=1e-15))
             self.assertEqual(
                 [entry[0] for entry in got["levels"][1]],
                 [entry[0] for entry in expected["levels"][1]],
@@ -236,7 +296,7 @@ class PipelineTests(unittest.TestCase):
                 "--work", tmp,
                 "--max-keys", "3",
                 "--surface",
-            ])
+            ] + FIXTURE_ESTIMATE)
             self.assertEqual(code, 0)
             dict_path = os.path.join(tmp, "dict.utf8")
             arpa_path = os.path.join(tmp, "lm_sc.3gm.arpa")
@@ -288,7 +348,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(main([
                 "all", "--xml", FIXTURE_XML, "--dict-full", FIXTURE_DICT,
                 "--dict-head", DICT_HEAD, "--work", tmp, "--max-keys", "8",
-            ]), 0)
+            ] + FIXTURE_ESTIMATE), 0)
             text = _read(os.path.join(tmp, "lm_sc.3gm.arpa"))
             self.assertIn("\\0-gram\\1\n", text)
             self.assertNotIn("\\data\\", text)
@@ -334,7 +394,7 @@ class SlmpackTests(unittest.TestCase):
             self.assertEqual(main([
                 "all", "--xml", FIXTURE_XML, "--dict-full", FIXTURE_DICT,
                 "--dict-head", DICT_HEAD, "--work", tmp, "--max-keys", "4",
-            ]), 0)
+            ] + FIXTURE_ESTIMATE), 0)
             arpa_path = os.path.join(tmp, "lm_sc.3gm.arpa")
             dict_path = os.path.join(tmp, "dict.utf8")
             slm_path = os.path.join(tmp, "lm.slm")

@@ -7,11 +7,8 @@ categories, and file links are removed, and ordinary links keep their
 visible label. This is not a MediaWiki renderer.
 
 A sentence ends at 。！？ or at a paragraph break. Ideographic comma stays
-in the sentence; the trigram model treats ， as a word.
-
-When a traditional-character probe hits and opencc is absent, extraction
-fails instead of counting those characters as <unknown> against a
-simplified lexicon. If opencc is on PATH, conversion is ``opencc -c t2s``.
+in the sentence; the trigram model treats ， as a word. The caller supplies
+text that is already in the lexicon's script.
 """
 
 from __future__ import annotations
@@ -20,12 +17,9 @@ import bz2
 import gzip
 import os
 import re
-import shutil
-import subprocess
 import xml.etree.ElementTree as ET
 
 _TERMINATORS = set("。！？")
-_TRADITIONAL_PROBE = frozenset("們這個國說為與麼後發對開會時産廣東門問")
 _LINK_DROP_PREFIX = frozenset((
     "file", "image", "category", "wikipedia", "template", "media",
     "文件", "档案", "檔案", "分类", "分類", "模板", "维基", "維基",
@@ -180,46 +174,5 @@ def extract_dumps(paths, output):
     return count
 
 
-def _probe_traditional(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            if any(ch in _TRADITIONAL_PROBE for ch in line):
-                return True
-    return False
-
-
-def simplify_file(src, dest):
-    """Map traditional Han to simplified Han when opencc is available.
-
-    Returns ``opencc`` or ``identity``. Identity is allowed only when the
-    traditional-character probe does not hit.
-    """
-    parent = os.path.dirname(os.path.abspath(dest))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    opencc = shutil.which("opencc")
-    if opencc:
-        subprocess.run(
-            [opencc, "-c", "t2s", "-i", src, "-o", dest],
-            check=True,
-        )
-        return "opencc"
-    if _probe_traditional(src):
-        raise RuntimeError(
-            "traditional characters are present and opencc is not installed; "
-            "refusing to segment them with the simplified lexicon"
-        )
-    if os.path.abspath(src) != os.path.abspath(dest):
-        shutil.copyfile(src, dest)
-    return "identity"
-
-
 def dumps_to_sentences(paths, output):
-    raw = output + ".raw"
-    count = extract_dumps(paths, raw)
-    try:
-        mode = simplify_file(raw, output)
-    finally:
-        if os.path.exists(raw) and os.path.abspath(raw) != os.path.abspath(output):
-            os.remove(raw)
-    return count, mode
+    return extract_dumps(paths, output)

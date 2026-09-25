@@ -1,4 +1,4 @@
-.PHONY: all test fetch release clean
+.PHONY: all test release clean
 
 ROOT := $(abspath ..)
 export PYTHONPATH := $(ROOT)
@@ -14,15 +14,11 @@ RELEASE_MAX_KEYS ?= 2000000
 
 all:
 	$(RUN) all --xml $(XML) --dict-full $(DICT_FULL) --dict-head $(DICT_HEAD) \
-		--work $(WORK) --max-keys $(MAX_KEYS) --surface
+		--work $(WORK) --max-keys $(MAX_KEYS) --surface \
+		--cut 0,0,0 --discount ABS,0.5 --discount ABS,0.5 --discount ABS,0.5
 
 test:
 	$(PYTHON) $(ROOT)/pipeline/test_pipeline.py
-
-fetch:
-	@test -n "$(DEST)" || { echo "DEST= directory is required"; exit 1; }
-	@test -n "$(URL)" || { echo "URL= dump URL is required"; exit 1; }
-	$(RUN) fetch --dest $(DEST) $(foreach u,$(URL),--url $(u))
 
 release:
 	@test -n "$(DUMP)" || { echo "DUMP= pages-articles dump (optionally more paths)"; exit 1; }
