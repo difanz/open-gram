@@ -1,4 +1,13 @@
-.PHONY: clean
+.PHONY: clean fetch-cedict merge-cedict
+
+# Latest MDBG CC-CEDICT gzip. The dump is gitignored; see lexicon/fetch_cedict.py.
+# merge-cedict appends missing simplified surfaces. It does not call merge.py.
+
+fetch-cedict:
+	python3 fetch_cedict.py --output $(DATA_DIR)/cedict_1_0_ts_utf-8_mdbg.txt
+
+merge-cedict: fetch-cedict
+	python3 merge_cedict.py --dict $(DATA_DIR)/dict.full --cedict $(DATA_DIR)/cedict_1_0_ts_utf-8_mdbg.txt --output $(DATA_DIR)/dict.full
 
 DATA_DIR=../data
 
