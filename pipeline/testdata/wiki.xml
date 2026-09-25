@@ -1,0 +1,35 @@
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.10/" version="0.10">
+  <siteinfo>
+    <sitename>fixture</sitename>
+  </siteinfo>
+  <page>
+    <title>北京</title>
+    <ns>0</ns>
+    <revision>
+      <text xml:space="preserve">北京是中国的首都。我爱北京。
+电话是12。
+你好@北京。
+== 参见 ==
+[[北京|京城]]欢迎你。
+{{note|忽略}}
+[[Category:地理]]
+&lt;ref&gt;注&lt;/ref&gt;
+</text>
+    </revision>
+  </page>
+  <page>
+    <title>重定向</title>
+    <ns>0</ns>
+    <redirect title="北京" />
+    <revision>
+      <text xml:space="preserve">#REDIRECT [[北京]]</text>
+    </revision>
+  </page>
+  <page>
+    <title>讨论</title>
+    <ns>1</ns>
+    <revision>
+      <text xml:space="preserve">不应进入语料。</text>
+    </revision>
+  </page>
+</mediawiki>
