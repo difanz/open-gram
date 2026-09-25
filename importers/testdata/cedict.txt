@@ -1,0 +1,13 @@
+# CC-CEDICT fixture
+# blank line below is part of the format
+
+中國 中国 [Zhong1 guo2] /China/Middle Kingdom/
+中國 中国 [Zhong1 guo2] /same reading again/
+了 了 [le5] /(completed action marker)/
+了 了 [liao3] /to finish/to understand/
+女 女 [nu:3] /woman/female/
+略 略 [lu:e4] /brief/sketch/
+花兒 花儿 [hua1 r5] /erhua form of 花/
+兒 儿 [er2] /son/
+兒 儿 [r5] /non-syllabic diminutive suffix/
+X光 X光 [X guang1] /X-ray/

@@ -1,1 +1,3 @@
-# One script per source. Each writes a sentence corpus for pipeline.run.
+# One script per source.
+# wikimedia writes a sentence corpus for pipeline.run.
+# cedict writes dict.full lines (simplified word, sunpinyin readings).
