@@ -78,6 +78,17 @@ class LawdbTests(unittest.TestCase):
     def test_gb18030_page_decodes(self):
         self.assertEqual(lawdb.decode_page("测试".encode("gb2312")), "测试")
 
+    def test_newline_inside_a_character_is_joined(self):
+        # 、 is the two bytes A1 A2. show.php sometimes wraps between them.
+        raw = "前文".encode("gb2312") + b"\xa1\n\xa2" + "后文。".encode("gb2312")
+        self.assertIn("前文、后文。", lawdb.decode_page(raw))
+
+    def test_one_bad_byte_keeps_the_rest(self):
+        raw = "甲".encode("gb2312") + b"\xff" + "乙。".encode("gb2312")
+        text = lawdb.decode_page(raw)
+        self.assertIn("甲", text)
+        self.assertIn("乙。", text)
+
     def test_scrape_writes_local_html(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = os.path.join(tmp, "laws.txt")

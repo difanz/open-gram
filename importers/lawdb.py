@@ -38,12 +38,68 @@ _TABLE = re.compile(r"<table\b[^>]*\bwidth\s*=\s*[\"']?760", re.IGNORECASE)
 _TOO_SHORT = "关键词太短"
 
 
+def _gbk_trail(byte):
+    return 0x40 <= byte <= 0xFE and byte != 0x7F
+
+
+def _join_wrapped_characters(data):
+    """show.php sometimes breaks a two-byte character with a newline."""
+    out = bytearray()
+    index = 0
+    size = len(data)
+    while index < size:
+        byte = data[index]
+        if 0x81 <= byte <= 0xFE and index + 1 < size and data[index + 1] in (10, 13):
+            trail_at = index + 1
+            if data[trail_at] == 13 and trail_at + 1 < size and data[trail_at + 1] == 10:
+                trail_at += 2
+            else:
+                trail_at += 1
+            if trail_at < size and _gbk_trail(data[trail_at]):
+                pair = bytes((byte, data[trail_at]))
+                try:
+                    pair.decode("gb18030")
+                except UnicodeDecodeError:
+                    pass
+                else:
+                    out.extend(pair)
+                    index = trail_at + 1
+                    continue
+        out.append(byte)
+        index += 1
+    return bytes(out)
+
+
 def decode_page(data):
-    """gb2312 pages, decoded with the gb18030 superset."""
-    try:
-        return data.decode("gb18030")
-    except UnicodeDecodeError as exc:
-        raise ValueError("page is not gb18030") from exc
+    """gb2312 pages, decoded as gb18030.
+
+    A newline wrapped into a two-byte character is removed. A byte that
+    still does not decode is skipped so the rest of the statute is kept.
+    """
+    data = _join_wrapped_characters(data)
+    chars = []
+    index = 0
+    size = len(data)
+    while index < size:
+        if data[index] < 0x80:
+            chars.append(chr(data[index]))
+            index += 1
+            continue
+        decoded = None
+        for width in (2, 4):
+            if index + width > size:
+                continue
+            try:
+                decoded = data[index:index + width].decode("gb18030")
+            except UnicodeDecodeError:
+                continue
+            index += width
+            break
+        if decoded is None:
+            index += 1
+            continue
+        chars.append(decoded)
+    return "".join(chars)
 
 
 def _table_slice(page):
