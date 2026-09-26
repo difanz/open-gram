@@ -2,7 +2,8 @@
 """Build dict.utf8 from dict.full and lexicon/dict_head.utf8.
 
 Numbering is add_id.py: head ids are kept, and dict.full receives
-100, 101, ... in file order. CC-CEDICT is not an input.
+100, 101, ... in file order. This stage reads dict.full only.
+CC-CEDICT surfaces are appended earlier by lexicon/merge_cedict.py.
 """
 
 from __future__ import annotations

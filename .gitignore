@@ -13,3 +13,7 @@ build/*
 *.log
 __pycache__/
 pipeline/build/
+artifacts/
+data/dict.utf8
+data/cedict_1_0_ts_utf-8_mdbg.txt
+data/cedict_1_0_ts_utf-8_mdbg.txt.gz

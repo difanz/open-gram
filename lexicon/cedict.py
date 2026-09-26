@@ -18,12 +18,19 @@ from optparse import OptionParser
 
 def normalize_pinyins(pinyins):
     """lower case all pinyins, and remove the tones. if there is no tone, simply raise an exception
+
+    A tone digit is only stripped when the rest of the syllable contains a
+    letter. A bare number such as ``11`` is not a pinyin syllable; treating
+    its last digit as a tone would leave another digit behind.
     """
     def normalize(py):
         tones = ('1', '2', '3', '4', '5')
-        if py[-1] not in tones:
+        if not py or py[-1] not in tones:
             raise Exception("not a pinyin: %s" % py)
-        return py[:-1].lower()
+        base = py[:-1].lower()
+        if not any(ch.isalpha() for ch in base):
+            raise Exception("not a pinyin: %s" % py)
+        return base
     return "'".join(normalize(py) for py in pinyins.split())
     
 cedict_pattern = re.compile(r'\S+ (\S+) \[([^\]]+)\].*')
