@@ -21,11 +21,13 @@ def normalize_py(py):
 def normalize_pys(pys):
     return "'".join([normalize_py(py) for py in pys.split("'")])
 
-def main(fname_in, fname_out):
+def main(fname_in, fname_out, fname_head='dict_head.utf8'):
+    # Default is dict_head.utf8 in the cwd, which is lexicon/ under the
+    # lexicon Makefile. Other callers pass an absolute path.
     dict_in = codecs.open(fname_in, 'r', 'utf-8')
     dict_out = codecs.open(fname_out, 'w', 'utf-8')
     index = 100
-    with codecs.open('dict_head.utf8', 'r', 'utf-8') as dict_head:
+    with codecs.open(fname_head, 'r', 'utf-8') as dict_head:
         head = dict_head.read()
         dict_out.write(head)
     
@@ -34,6 +36,8 @@ def main(fname_in, fname_out):
         syls = ' '.join(normalize_pys(pys) for pys in syls.split())
         print(word, index, syls, file=dict_out)
         index += 1
+    dict_in.close()
+    dict_out.close()
 
 if __name__ == '__main__':
     parser = OptionParser()
