@@ -20,6 +20,7 @@ all:
 test:
 	$(PYTHON) $(ROOT)/pipeline/test_pipeline.py
 	$(PYTHON) $(ROOT)/importers/test_wikimedia.py
+	$(PYTHON) $(ROOT)/importers/test_fetch_zhwiki_sample.py
 	$(PYTHON) $(ROOT)/lexicon/test_merge_cedict.py
 
 release:
