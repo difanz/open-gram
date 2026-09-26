@@ -11,3 +11,4 @@ build/*
 *.la
 *.so
 *.log
+__pycache__/
