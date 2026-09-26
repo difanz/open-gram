@@ -1,24 +1,32 @@
 # -*- coding: utf-8 -*-
 """Wikimedia pages-articles XML to a sentence corpus.
 
-The n-gram driver reads that corpus and does not parse XML. HTML in the
-article text is stripped with bleach. Traditional Han is converted with
-opencc (t2s). The input is uncompressed XML. Another source gets its own
-script in this directory.
+The n-gram driver reads that corpus and does not parse XML. Article text
+is reduced to prose by ``importers.wikitext`` (templates, links, tables,
+citations), then leftover HTML is stripped with bleach. Traditional Han
+is converted with opencc (t2s). The input is uncompressed XML. Another
+source gets its own script in this directory.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 
 import bleach
 import opencc
 
+from importers.wikitext import has_han, strip_wikitext, tidy_plain
+
 _TERMINATORS = set("。！？")
 _OPENCC = opencc.OpenCC("t2s")
+# A pipe with no Chinese punctuation is a leftover table or file parameter.
+# Prose that mentions the character also has a comma or a full stop.
+_PIPE_PROSE = re.compile(r"[。！？，、；：]")
+_MARKUP_LEFT = ("{{", "[[", "]]", "{|", "|}", "==")
 
 
 def _local(tag):
@@ -49,9 +57,26 @@ def _is_redirect(page, text):
 
 
 def normalize(text):
-    """Strip HTML, then convert traditional Han to simplified Han."""
-    plain = bleach.clean(text, tags=[], strip=True)
-    return _OPENCC.convert(plain)
+    """Wiki markup to simplified prose. Paragraph breaks stay newlines."""
+    plain = strip_wikitext(text)
+    plain = bleach.clean(plain, tags=[], strip=True)
+    plain = _OPENCC.convert(plain)
+    return tidy_plain(plain)
+
+
+def _keep_sentence(sentence):
+    """Drop leftovers that are not Chinese running text."""
+    if not has_han(sentence):
+        return False
+    lowered = sentence.lower()
+    if "<ref" in lowered:
+        return False
+    for marker in _MARKUP_LEFT:
+        if marker in sentence:
+            return False
+    if "|" in sentence and _PIPE_PROSE.search(sentence) is None:
+        return False
+    return True
 
 
 def iter_sentences(text):
@@ -66,10 +91,10 @@ def iter_sentences(text):
             if ch in _TERMINATORS:
                 sentence = "".join(buf).strip()
                 buf = []
-                if sentence:
+                if sentence and _keep_sentence(sentence):
                     yield sentence
         tail = "".join(buf).strip()
-        if tail:
+        if tail and _keep_sentence(tail):
             yield tail
 
 
