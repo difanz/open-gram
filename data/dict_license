@@ -1,4 +1,44 @@
-The dictionary contains some entries from android-pinyin-ime, which is 
+The word list in dict.full, and dict.utf8 built from it, combines two sources.
+The engine code in this repository is separate from this word list and is
+not relicensed by the merge below.
+
+1. Android Pinyin IME lexicon (Apache License 2.0)
+
+The original rows, kept in their original order at the start of dict.full,
+come from android-pinyin-ime and remain under the Apache License, Version 2.0.
+That notice is reproduced in full after the CC-CEDICT attribution.
+
+2. CC-CEDICT, published by MDBG (CC BY-SA 4.0)
+
+Simplified-Chinese surfaces that were not already in the Android lexicon were
+appended from CC-CEDICT. Traditional spellings were not added: conversion
+uses the simplified field only (lexicon/cedict.py). Pinyin is toneless and
+apostrophe-joined. No search-frequency field was added.
+
+  Work: CC-CEDICT
+  Publisher: MDBG
+  Source page: https://www.mdbg.net/chinese/dictionary?page=cedict
+  Download: https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt.gz
+  Release: 2026-09-25T08:54:32Z
+  Entries in that release: 125109
+  gzip SHA-256: ee4a029f3a608ccc998b63e73ef933753bf3dce6ec59925aeaf8e69a490b46a1
+  text SHA-256: f8d5912ffa25149a24a229e75fb0691ffce5462770d270ba06c3e7757d6622bf
+  License: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+  https://creativecommons.org/licenses/by-sa/4.0/
+
+Because the merged word list includes CC-CEDICT material, dict.full and
+dict.utf8 are not Apache-only. Redistribution of the merged word list must
+comply with CC BY-SA 4.0, including attribution and ShareAlike, and must
+keep this Apache notice for the Android-derived portion.
+
+CC-CEDICT copyright is held by its contributors. This file points at the
+CC BY-SA 4.0 legal code; it is not a substitute for that license.
+
+===============================================================================
+Android Pinyin IME notice (Apache License, Version 2.0)
+===============================================================================
+
+The dictionary contains some entries from android-pinyin-ime, which is
 distributed under Apache License Version 2.0
 ===============================================================================
 
