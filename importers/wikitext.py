@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """MediaWiki source to plain text for the sentence splitter.
 
-Templates, citation tags, wiki tables, and file or category links are
-removed. An ordinary wikilink keeps its visible label (or the target
-title when it has no label). ``{{lang}}`` keeps its last parameter when
-that parameter contains Han, so the word being named survives.
-OpenCC and the final sentence filter stay in ``importers.wikimedia``.
+Templates, conversion rules, citations, and tables are deleted whole.
+A wikilink is kept only when its visible text is plain Chinese; anything
+else in the link is dropped with the link. OpenCC and the sentence
+filter stay in ``importers.wikimedia``.
 """
 
 from __future__ import annotations
@@ -47,40 +46,36 @@ _EMPTY_BRACKETS = re.compile(r"（\s*）|\(\s*\)|\[\s*\]|［\s*］")
 _PX = re.compile(r"\b\d+px\b", re.IGNORECASE)
 _CLASS_ATTR = re.compile(r"\bclass\s*=\s*[\w.-]+", re.IGNORECASE)
 _HAN = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]|[\U00020000-\U0003ffff]")
-# MediaWiki language-converter rules, not templates: -{zh-cn:简;zh-tw:繁}-
+# Language-converter markup, including variant maps and empty blockers.
 _CONVERTER = re.compile(r"-{([^{}]*)}-")
-_CONVERTER_PREF = ("zh-cn", "zh-hans", "zh-sg", "zh-my")
+# Visible text of a kept link: Han, digits, and Chinese punctuation only.
+_CN_PUNCT = frozenset("，。！？、；：…—～·・「」『』《》（）“”‘’－")
 
 
 def has_han(text):
     return _HAN.search(text) is not None
 
 
-def _converter_replacement(inner):
-    """Prefer a simplified variant. A rule with no labels keeps its text."""
-    inner = inner.strip()
-    if not inner or ":" not in inner:
-        return inner
-    found = {}
-    for part in inner.split(";"):
-        if ":" not in part:
+def _is_plain_chinese(text):
+    """True when every character is Han, a digit, or Chinese punctuation."""
+    if not has_han(text):
+        return False
+    for ch in text:
+        if ch.isspace() or ch in _CN_PUNCT or ch.isdigit():
             continue
-        key, value = part.split(":", 1)
-        found[key.strip().lower()] = value.strip()
-    if not found:
-        return inner
-    for key in _CONVERTER_PREF:
-        if found.get(key):
-            return found[key]
-    return next(iter(found.values()))
+        if "\uff10" <= ch <= "\uff19":
+            continue
+        if _HAN.match(ch) is None:
+            return False
+    return True
 
 
-def unwrap_converter_rules(text):
-    """Replace ``-{...}-`` rules. Inner rules are expanded first."""
+def delete_converter_rules(text):
+    """Delete ``-{...}-`` rules, variant text included."""
     previous = None
     while previous != text:
         previous = text
-        text = _CONVERTER.sub(lambda match: _converter_replacement(match.group(1)), text)
+        text = _CONVERTER.sub("", text)
     return text
 
 
@@ -143,15 +138,19 @@ def _drop_link(title):
     return _ASCII_PREFIX.fullmatch(prefix) is not None
 
 
-def _template_name(tmpl):
-    name = str(tmpl.name).strip().lower()
-    if name.startswith("template:"):
-        name = name[len("template:"):]
-    return name.split(":", 1)[-1].strip()
+def _link_visible(link):
+    shown = link.text if link.text is not None else link.title
+    return str(shown).strip()
 
 
-def _is_lang_template(name):
-    return name == "lang" or name.startswith("lang-") or name.startswith("langx")
+def _keep_or_drop_link(code, link, visible):
+    try:
+        if _is_plain_chinese(visible):
+            code.replace(link, visible)
+        else:
+            code.remove(link)
+    except ValueError:
+        pass
 
 
 def _strip_parsed(text):
@@ -167,23 +166,17 @@ def _strip_parsed(text):
             title = str(link.title)
         except ValueError:
             continue
-        if _drop_link(title):
+        if _drop_link(title) or not _is_plain_chinese(_link_visible(link)):
             try:
                 code.remove(link)
             except ValueError:
                 pass
-    # Top-level lang templates only. A lang template inside a citation is
-    # removed with that citation.
-    for tmpl in list(code.filter_templates(recursive=False)):
-        if not _is_lang_template(_template_name(tmpl)) or not tmpl.params:
             continue
-        value = tmpl.params[-1].value
-        if not has_han(str(value)):
-            continue
-        try:
-            code.replace(tmpl, value)
-        except ValueError:
-            pass
+        _keep_or_drop_link(code, link, _link_visible(link))
+    for link in list(code.filter_external_links(recursive=True)):
+        title = str(link.title).strip() if link.title is not None else ""
+        _keep_or_drop_link(code, link, title)
+    # strip_code deletes every remaining template, including {{lang}}.
     return code.strip_code(normalize=True, collapse=True, keep_template_params=False)
 
 
@@ -217,7 +210,7 @@ def strip_wikitext(text):
     """Return prose with MediaWiki markup removed. Newlines separate paragraphs."""
     if not text:
         return ""
-    plain = unwrap_converter_rules(text)
+    plain = delete_converter_rules(text)
     plain = remove_wiki_tables(plain)
     try:
         plain = _strip_parsed(plain)

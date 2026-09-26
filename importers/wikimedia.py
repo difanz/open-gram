@@ -19,14 +19,15 @@ import xml.etree.ElementTree as ET
 import bleach
 import opencc
 
-from importers.wikitext import has_han, strip_wikitext, tidy_plain
+from importers.wikitext import strip_wikitext, tidy_plain
 
-_TERMINATORS = set("。！？")
+_TERMINATORS = ("。", "！", "？")
 _OPENCC = opencc.OpenCC("t2s")
-# A pipe with no Chinese punctuation is a leftover table or file parameter.
-# Prose that mentions the character also has a comma or a full stop.
-_PIPE_PROSE = re.compile(r"[。！？，、；：]")
-_MARKUP_LEFT = ("{{", "[[", "]]", "{|", "|}", "==")
+_HAN_RUN = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]|[\U00020000-\U0003ffff]")
+_LATIN = re.compile(r"[A-Za-z]")
+# Leftover wiki syntax. Chinese brackets such as 《》 stay; they are prose.
+_MARKUP_CHARS = set("|{}[]<>=_")
+_MIN_HAN = 4
 
 
 def _local(tag):
@@ -65,16 +66,19 @@ def normalize(text):
 
 
 def _keep_sentence(sentence):
-    """Drop leftovers that are not Chinese running text."""
-    if not has_han(sentence):
+    """Running Chinese prose only. Headings and markup scraps are dropped."""
+    if not sentence.endswith(_TERMINATORS):
+        return False
+    han = len(_HAN_RUN.findall(sentence))
+    if han < _MIN_HAN:
+        return False
+    if any(ch in sentence for ch in _MARKUP_CHARS):
         return False
     lowered = sentence.lower()
-    if "<ref" in lowered:
+    if "<ref" in lowered or "{{" in sentence or "[[" in sentence or "==" in sentence:
         return False
-    for marker in _MARKUP_LEFT:
-        if marker in sentence:
-            return False
-    if "|" in sentence and _PIPE_PROSE.search(sentence) is None:
+    latin = len(_LATIN.findall(sentence))
+    if latin and latin >= han:
         return False
     return True
 
